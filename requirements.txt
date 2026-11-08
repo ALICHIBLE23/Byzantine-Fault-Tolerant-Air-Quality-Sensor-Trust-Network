@@ -1,0 +1,13 @@
+# Shared dev dependencies (Python 3.12). Services get their own slimmer lists later.
+paho-mqtt==2.1.0
+aiomqtt==2.3.0
+redis==5.2.1
+psycopg[binary]==3.2.3
+numpy==2.2.1
+pandas==2.2.3
+matplotlib==3.10.0
+fastapi==0.115.6
+uvicorn==0.34.0
+prometheus-client==0.21.1
+pytest==8.3.4
+jupyter==1.1.1

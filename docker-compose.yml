@@ -1,0 +1,83 @@
+name: trustmesh
+
+# Step 0: infrastructure only. TrustMesh's own services (sensors, aggregators,
+# logging service, dashboard) are added in later stages.
+# The ":Z" mount option relabels files for SELinux (needed on Fedora,
+# ignored on Docker Desktop for Windows/macOS).
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.20
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro,Z
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trustmesh}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trustmesh}
+      POSTGRES_DB: ${POSTGRES_DB:-trustmesh}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro,Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,Z
+      - prom-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      POSTGRES_USER: ${POSTGRES_USER:-trustmesh}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trustmesh}
+      POSTGRES_DB: ${POSTGRES_DB:-trustmesh}
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro,Z
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  pg-data:
+  prom-data:
+  grafana-data:
