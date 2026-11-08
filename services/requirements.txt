@@ -1,0 +1,7 @@
+aiomqtt==2.3.0
+psycopg[binary]==3.2.3
+prometheus-client==0.21.1
+numpy==2.2.1
+fastapi==0.115.6
+uvicorn==0.34.0
+redis==5.2.1

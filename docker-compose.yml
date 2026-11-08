@@ -1,11 +1,22 @@
 name: trustmesh
 
-# Step 0: infrastructure only. TrustMesh's own services (sensors, aggregators,
-# logging service, dashboard) are added in later stages.
 # The ":Z" mount option relabels files for SELinux (needed on Fedora,
 # ignored on Docker Desktop for Windows/macOS).
 
+x-python-service: &python-service
+  build: .
+  image: trustmesh-python:dev
+  restart: unless-stopped
+  environment: &python-env
+    POSTGRES_USER: ${POSTGRES_USER:-trustmesh}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trustmesh}
+    POSTGRES_DB: ${POSTGRES_DB:-trustmesh}
+    MQTT_HOST: mosquitto
+    PG_HOST: postgres
+    LOG_URL: http://logging-svc:8000/logs
+
 services:
+  # ---------------- infrastructure ----------------
   mosquitto:
     image: eclipse-mosquitto:2.0.20
     ports:
@@ -63,6 +74,7 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/json/trustmesh-overview.json
       POSTGRES_USER: ${POSTGRES_USER:-trustmesh}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trustmesh}
       POSTGRES_DB: ${POSTGRES_DB:-trustmesh}
@@ -75,6 +87,56 @@ services:
       - prometheus
       - postgres
     restart: unless-stopped
+
+  # ---------------- TrustMesh services ----------------
+  logging-svc:
+    <<: *python-service
+    command: ["uvicorn", "services.logging_svc.main:app", "--host", "0.0.0.0", "--port", "8000",
+              "--no-access-log"]
+    environment:
+      <<: *python-env
+      INSTANCE_ID: logging-1
+    ports:
+      - "${LOGGING_PORT:-8081}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  sensors:
+    <<: *python-service
+    command: ["python", "-m", "services.sensors.main"]
+    environment:
+      <<: *python-env
+      INSTANCE_ID: sensors-1
+      NUM_SENSORS: ${NUM_SENSORS:-400}
+      PUBLISH_INTERVAL_S: ${PUBLISH_INTERVAL_S:-2.0}
+    depends_on:
+      mosquitto:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      logging-svc:
+        condition: service_healthy
+
+  aggregator:
+    <<: *python-service
+    command: ["python", "-m", "services.aggregator.main"]
+    environment:
+      <<: *python-env
+      INSTANCE_ID: agg-1
+      REGIONS: all
+    depends_on:
+      mosquitto:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      logging-svc:
+        condition: service_healthy
 
 volumes:
   redis-data:

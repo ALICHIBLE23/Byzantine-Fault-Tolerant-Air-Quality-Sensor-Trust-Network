@@ -7,7 +7,14 @@ scrape_configs:
     static_configs:
       - targets: ["localhost:9090"]
 
-  # Stage 1+: TrustMesh services expose /metrics and are listed here, e.g.
-  # - job_name: aggregators
-  #   static_configs:
-  #     - targets: ["aggregator-r1-a:8000", "aggregator-r1-b:8000"]
+  - job_name: sensors
+    static_configs:
+      - targets: ["sensors:8000"]
+
+  - job_name: aggregators
+    static_configs:
+      - targets: ["aggregator:8000"]
+
+  - job_name: logging-svc
+    static_configs:
+      - targets: ["logging-svc:8000"]
