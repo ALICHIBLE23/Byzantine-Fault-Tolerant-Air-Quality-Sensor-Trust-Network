@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from collections import Counter as Tally
 
 import aiomqtt
 import psycopg
@@ -36,10 +37,10 @@ ON CONFLICT (sensor_id) DO UPDATE SET
 
 
 class SimSensor:
-    def __init__(self, spec: SensorSpec, behavior: Behavior, seed: int, seq_start: int):
+    def __init__(self, spec: SensorSpec, cfg: Config, seq_start: int, start_t: float):
         self.spec = spec
-        self.behavior = behavior
-        self.rng = random.Random(seed * 1_000_003 + spec.index)
+        self.rng = random.Random(cfg.seed * 1_000_003 + spec.index)
+        self.behavior: Behavior = make_behavior(spec.behavior, cfg, self.rng, start_t)
         # Starting the sequence at the boot time in ms keeps it increasing across restarts,
         # so (sensor_id, seq) stays unique and deduplication keeps working.
         self.seq = seq_start
@@ -92,10 +93,12 @@ async def main() -> None:
 
     fleet = build_fleet(cfg)
     seq_start = time.time_ns() // 1_000_000
-    sensors = [SimSensor(s, make_behavior(s.behavior, cfg), cfg.seed, seq_start) for s in fleet]
+    sensors = [SimSensor(s, cfg, seq_start, time.time()) for s in fleet]
     ACTIVE.set(len(sensors))
     regions = sorted({s.region for s in fleet})
-    log.info("built fleet of %d sensors across %d regions %s", len(sensors), len(regions), regions)
+    behaviors = Tally(s.behavior for s in fleet)
+    log.info("built fleet of %d sensors across %d regions %s; behaviors %s",
+             len(sensors), len(regions), regions, dict(behaviors))
 
     await register_fleet(cfg, fleet, log)
 

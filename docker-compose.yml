@@ -13,7 +13,29 @@ x-python-service: &python-service
     POSTGRES_DB: ${POSTGRES_DB:-trustmesh}
     MQTT_HOST: mosquitto
     PG_HOST: postgres
+    REDIS_HOST: redis
     LOG_URL: http://logging-svc:8000/logs
+
+# Aggregator replicas. INSTANCE_ID must equal the service name (experiments use it to find containers).
+x-aggregator: &aggregator
+  <<: *python-service
+  command: ["python", "-m", "services.aggregator.main"]
+  stop_grace_period: 5s
+  depends_on:
+    mosquitto:
+      condition: service_started
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    logging-svc:
+      condition: service_healthy
+
+x-aggregator-env: &aggregator-env
+  <<: *python-env
+  LEASE_TTL_MS: ${LEASE_TTL_MS:-3000}
+  LEASE_RENEW_MS: ${LEASE_RENEW_MS:-1000}
+  FENCING_SELF_CHECK: ${FENCING_SELF_CHECK:-true}
 
 services:
   # ---------------- infrastructure ----------------
@@ -115,6 +137,7 @@ services:
       INSTANCE_ID: sensors-1
       NUM_SENSORS: ${NUM_SENSORS:-400}
       PUBLISH_INTERVAL_S: ${PUBLISH_INTERVAL_S:-2.0}
+      BEHAVIOR_MIX: ${BEHAVIOR_MIX:-}
     depends_on:
       mosquitto:
         condition: service_started
@@ -123,18 +146,44 @@ services:
       logging-svc:
         condition: service_healthy
 
-  aggregator:
+  # Partition A (north) and partition B (south), two replicas each.
+  aggregator-a1:
+    <<: *aggregator
+    environment:
+      <<: *aggregator-env
+      INSTANCE_ID: aggregator-a1
+      REGIONS: r-0-0,r-0-1
+
+  aggregator-a2:
+    <<: *aggregator
+    environment:
+      <<: *aggregator-env
+      INSTANCE_ID: aggregator-a2
+      REGIONS: r-0-0,r-0-1
+
+  aggregator-b1:
+    <<: *aggregator
+    environment:
+      <<: *aggregator-env
+      INSTANCE_ID: aggregator-b1
+      REGIONS: r-1-0,r-1-1
+
+  aggregator-b2:
+    <<: *aggregator
+    environment:
+      <<: *aggregator-env
+      INSTANCE_ID: aggregator-b2
+      REGIONS: r-1-0,r-1-1
+
+  evaluator:
     <<: *python-service
-    command: ["python", "-m", "services.aggregator.main"]
+    command: ["python", "-m", "services.evaluator.main"]
     environment:
       <<: *python-env
-      INSTANCE_ID: agg-1
-      REGIONS: all
+      INSTANCE_ID: evaluator-1
+      NUM_SENSORS: ${NUM_SENSORS:-400}
+      BEHAVIOR_MIX: ${BEHAVIOR_MIX:-}
     depends_on:
-      mosquitto:
-        condition: service_started
-      postgres:
-        condition: service_healthy
       logging-svc:
         condition: service_healthy
 

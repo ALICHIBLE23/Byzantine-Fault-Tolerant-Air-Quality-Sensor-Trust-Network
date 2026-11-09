@@ -7,6 +7,7 @@ import pytest
 from common.config import load_config
 from common.schemas import Reading
 from services.aggregator import main as agg_module
+from services.aggregator.leases import StaticLeases
 from services.aggregator.main import Aggregator
 
 
@@ -22,7 +23,7 @@ class FakeClock:
 def setup(monkeypatch):
     clock = FakeClock(1_700_000_000_000)
     monkeypatch.setattr(agg_module, "now_ms", clock)
-    agg = Aggregator(load_config("test"), logging.getLogger("test"))
+    agg = Aggregator(load_config("test"), logging.getLogger("test"), StaticLeases())
     return agg, clock
 
 
@@ -41,7 +42,7 @@ def test_window_is_closed_after_grace_and_produces_all_algorithms(setup):
     clock.ms += 2
     agg.close_due_windows()
     rows = {row[3]: row for row, _ in agg.estimate_rows}
-    assert set(rows) == {"mean", "median", "trimmed_mean"}
+    assert set(rows) == {"mean", "median", "trimmed_mean", "trustmesh"}
     assert rows["mean"][4] == pytest.approx(12.0)
     assert rows["mean"][6] == 5  # n_sensors
 
@@ -75,6 +76,17 @@ def test_late_readings_are_stored_but_not_aggregated(setup):
     assert agg.handle(reading("s-1", 1, ws + 10), clock()) == "late"
     assert len(agg.reading_rows) == 1
     assert not agg.windows
+
+
+def test_window_close_records_trust_for_every_sensor(setup):
+    agg, clock = setup
+    ws = agg.accept_from
+    for i in range(6):
+        agg.handle(Reading(f"s-{i}", "r-0-0", 0.1 * i, 0.1, 20.0 + i * 0.1, ws + 50, 1).to_json(), clock())
+    clock.ms = ws + 60_000
+    agg.close_due_windows()
+    assert len(agg.trust_rows) == 6 and len(agg.history_rows) == 6
+    assert "r-0-0" in agg.engines
 
 
 def test_invalid_and_future_readings_are_rejected(setup):

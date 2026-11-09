@@ -11,6 +11,15 @@ import socket
 from dataclasses import dataclass
 
 
+def _bool(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(raw)
+
+
 def _get(name: str, default, cast=str):
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -35,6 +44,12 @@ class Config:
     pg_user: str
     pg_password: str
     pg_db: str
+    # Coordination (leases, shared trust state)
+    redis_host: str
+    redis_port: int
+    lease_ttl_ms: int
+    lease_renew_ms: int
+    fencing_self_check: bool
     # Observability
     log_url: str
     metrics_port: int
@@ -52,6 +67,7 @@ class Config:
     num_sensors: int
     publish_interval_s: float
     noise_std: float
+    behavior_mix: str
     # Aggregation
     regions: str
     window_ms: int
@@ -85,6 +101,11 @@ def load_config(service_name: str) -> Config:
         pg_user=_get("POSTGRES_USER", "trustmesh"),
         pg_password=_get("POSTGRES_PASSWORD", "trustmesh"),
         pg_db=_get("POSTGRES_DB", "trustmesh"),
+        redis_host=_get("REDIS_HOST", "redis"),
+        redis_port=_get("REDIS_PORT", 6379, int),
+        lease_ttl_ms=_get("LEASE_TTL_MS", 3000, int),
+        lease_renew_ms=_get("LEASE_RENEW_MS", 1000, int),
+        fencing_self_check=_get("FENCING_SELF_CHECK", True, _bool),
         log_url=_get("LOG_URL", "http://logging-svc:8000/logs"),
         metrics_port=_get("METRICS_PORT", 8000, int),
         seed=_get("SEED", 42, int),
@@ -99,6 +120,7 @@ def load_config(service_name: str) -> Config:
         num_sensors=_get("NUM_SENSORS", 400, int),
         publish_interval_s=_get("PUBLISH_INTERVAL_S", 2.0, float),
         noise_std=_get("NOISE_STD", 2.0, float),
+        behavior_mix=_get("BEHAVIOR_MIX", ""),
         regions=_get("REGIONS", "all"),
         window_ms=_get("WINDOW_MS", 5000, int),
         grace_ms=_get("GRACE_MS", 2000, int),

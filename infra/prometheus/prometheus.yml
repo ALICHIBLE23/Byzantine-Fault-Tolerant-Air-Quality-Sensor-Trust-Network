@@ -13,8 +13,12 @@ scrape_configs:
 
   - job_name: aggregators
     static_configs:
-      - targets: ["aggregator:8000"]
+      - targets: ["aggregator-a1:8000", "aggregator-a2:8000", "aggregator-b1:8000", "aggregator-b2:8000"]
 
   - job_name: logging-svc
     static_configs:
       - targets: ["logging-svc:8000"]
+
+  - job_name: evaluator
+    static_configs:
+      - targets: ["evaluator:8000"]
