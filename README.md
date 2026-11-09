@@ -12,7 +12,35 @@ python -m experiments.check_stage1   # end-to-end check (wait ~30 s after start)
 python -m experiments.check_stage2   # trust check (set BEHAVIOR_MIX, wait 3-4 min)
 python -m experiments.check_stage3   # replication and leadership check
 python -m experiments.check_stage4   # border exchange and shared reputations
+python -m experiments.check_stage5   # alerting accuracy vs ground truth (run after 10+ min)
 ```
+
+## Quorum alerting
+
+Every aggregator replica, leader and standby, votes once per window on whether its region is above
+`ALERT_THRESHOLD` (35.5 ug/m3). The alerting service raises an alert only when `ALERT_QUORUM` of the
+2 replicas agree, so a single faulty replica can neither trigger nor hide an alert. Alerts close
+after `ALERT_CLEAR_WINDOWS` consecutive clear windows.
+
+Faulty replica experiment (in `.env`, then `docker compose up -d aggregator-b2 alerting`):
+
+```
+B2_VOTE_BIAS=30     # aggregator-b2 inflates every vote by 30 ug/m3
+ALERT_QUORUM=2      # its lies are blocked;  ALERT_QUORUM=1: they become false alarms
+```
+
+## Experiments
+
+| Script | Experiment | Needs the stack |
+|--------|------------|-----------------|
+| `experiments/trust_lab.py --sweep` | E1 accuracy vs % faulty sensors | no |
+| `experiments/failover.py` | E7 crash / stop / pause a leader | yes |
+| `experiments/concurrency_bench.py` | E8 concurrency strategies vs contention | yes (Redis) |
+| `experiments/scalability.py` | E5 throughput, latency, CPU vs fleet size | yes (~10 min) |
+| `experiments/tradeoffs.py` | E10 threshold, reputation speed, window size | no |
+| `experiments/check_stage5.py` | alert precision / recall vs baselines | yes |
+
+All results (CSV and PNG) are written to `results/`.
 
 ## Border exchange and concurrency control
 
@@ -87,7 +115,7 @@ python -m experiments.trust_lab --sweep --attack offset_high   # plot in results
 | MQTT broker        | localhost:1883                 | watch `readings/#` in MQTT Explorer    |
 | PostgreSQL         | localhost:5432                 | trustmesh / trustmesh / trustmesh      |
 
-## Components (Stage 4)
+## Components (Stage 5)
 
 | Service      | Code                         | Role |
 |--------------|------------------------------|------|
@@ -97,6 +125,7 @@ python -m experiments.trust_lab --sweep --attack offset_high   # plot in results
 | logging-svc  | services/logging_svc/        | Central log collection (stdout + PostgreSQL + HTTP API) |
 | mosquitto    | infra/mosquitto/             | MQTT message broker |
 | postgres     | infra/postgres/init/         | Sensors, readings, estimates, logs |
+| alerting     | services/alerting/           | Quorum of replica votes -> pollution alerts (PostgreSQL) |
 | evaluator    | services/evaluator/          | Evaluation only: publishes ground truth to Prometheus |
 | redis        |                              | Leader leases, fencing epochs, shared trust state |
 | prometheus   | infra/prometheus/            | Scrapes /metrics from every service |

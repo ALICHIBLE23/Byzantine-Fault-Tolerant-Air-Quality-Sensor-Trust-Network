@@ -66,3 +66,38 @@ def parse_reading(raw: bytes | bytearray | str) -> Reading:
     if not reading.sensor_id or not reading.region:
         raise ValueError("empty sensor_id or region")
     return reading
+
+
+# ---------------- alert votes (Stage 5) ----------------
+
+def votes_topic(region: str) -> str:
+    return f"votes/{region}"
+
+
+@dataclass(frozen=True, slots=True)
+class Vote:
+    """One replica's opinion about one region's window: is the estimate above the alert threshold?"""
+    region: str
+    window_start: int
+    replica: str
+    epoch: int
+    leader: bool
+    estimate: float
+    over: bool
+
+    def to_json(self) -> bytes:
+        return json.dumps({"v": SCHEMA_VERSION, "region": self.region, "window_start": self.window_start,
+                           "replica": self.replica, "epoch": self.epoch, "leader": self.leader,
+                           "estimate": round(self.estimate, 3), "over": self.over}, separators=(",", ":")).encode()
+
+
+def parse_vote(raw: bytes | bytearray | str) -> Vote:
+    try:
+        d = json.loads(raw)
+        vote = Vote(str(d["region"]), int(d["window_start"]), str(d["replica"]), int(d["epoch"]),
+                    bool(d["leader"]), float(d["estimate"]), bool(d["over"]))
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ValueError(f"invalid vote ({exc})") from None
+    if not math.isfinite(vote.estimate):
+        raise ValueError("non-finite estimate")
+    return vote

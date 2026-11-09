@@ -22,3 +22,7 @@ scrape_configs:
   - job_name: evaluator
     static_configs:
       - targets: ["evaluator:8000"]
+
+  - job_name: alerting
+    static_configs:
+      - targets: ["alerting:8000"]

@@ -74,6 +74,12 @@ class Config:
     border_exchange: bool
     concurrency: str
     concurrency_think_ms: float
+    # Alerting (Stage 5)
+    alert_threshold: float
+    alert_quorum: int
+    alert_replicas: int
+    alert_clear_windows: int
+    vote_bias: float
     window_ms: int
     grace_ms: int
     db_flush_interval_s: float
@@ -130,6 +136,11 @@ def load_config(service_name: str) -> Config:
         border_exchange=_get("BORDER_EXCHANGE", True, _bool),
         concurrency=_get("CONCURRENCY", "optimistic"),
         concurrency_think_ms=_get("CONCURRENCY_THINK_MS", 0.0, float),
+        alert_threshold=_get("ALERT_THRESHOLD", 35.5, float),
+        alert_quorum=_get("ALERT_QUORUM", 2, int),
+        alert_replicas=_get("ALERT_REPLICAS", 2, int),
+        alert_clear_windows=_get("ALERT_CLEAR_WINDOWS", 2, int),
+        vote_bias=_get("VOTE_BIAS", 0.0, float),
         window_ms=_get("WINDOW_MS", 5000, int),
         grace_ms=_get("GRACE_MS", 2000, int),
         db_flush_interval_s=_get("DB_FLUSH_INTERVAL_S", 1.0, float),

@@ -198,9 +198,41 @@ panels += [
     ], 16, BOTTOM, w=8, unit="s"),
 ]
 
+# ---- quorum alerting (Stage 5)
+BOTTOM = max(p["gridPos"]["y"] + p["gridPos"]["h"] for p in panels)
+panels += [
+    {"id": nid(), "type": "state-timeline", "title": "Pollution alerts per region",
+     "description": "An alert is open while a quorum of replicas agrees the region is above the threshold.",
+     "datasource": PROM, "gridPos": {"h": 7, "w": 12, "x": 0, "y": BOTTOM},
+     "targets": [{"refId": "A", "datasource": PROM, "expr": "max by (region) (tm_alerts_open)",
+                  "legendFormat": "{{region}}"}],
+     "fieldConfig": {"defaults": {
+         "color": {"mode": "fixed", "fixedColor": "#3a3a3a"},
+         "mappings": [{"type": "range", "options": {"from": -0.5, "to": 0.5,
+                                                    "result": {"text": "ok", "color": "#3a3a3a", "index": 0}}},
+                      {"type": "range", "options": {"from": 0.5, "to": 1.5,
+                                                    "result": {"text": "ALERT", "color": "red", "index": 1}}}],
+         "custom": {"fillOpacity": 85, "lineWidth": 0}}, "overrides": []},
+     "options": {"showValue": "auto", "mergeValues": True, "rowHeight": 0.85, "alignValue": "center",
+                 "legend": {"showLegend": False}, "tooltip": {"mode": "single"}}},
+    timeseries("Alert decisions per minute", [
+        ("sum by (decision) (increase(tm_alert_decisions_total[1m]))", "{{decision}}"),
+    ], 12, BOTTOM, h=7,
+        desc="blocked = some replicas voted over the threshold but fewer than the quorum.",
+        overrides=[color_override("alarm", "red"), color_override("blocked", "orange"),
+                   color_override("clear", "green")]),
+    {"id": nid(), "type": "table", "title": "Alerts", "datasource": PG,
+     "gridPos": {"h": 8, "w": 24, "x": 0, "y": BOTTOM + 7},
+     "targets": [sql_target(
+         "SELECT region, status, opened_window AS opened, closed_window AS closed, "
+         "round(peak_estimate::numeric, 1) AS \"peak ug/m3\", votes_over || '/' || votes_total AS votes, quorum "
+         "FROM alerts ORDER BY opened_window DESC LIMIT 50")],
+     "fieldConfig": {"defaults": {}, "overrides": []}, "options": {"showHeader": True, "cellHeight": "sm"}},
+]
+
 dashboard = {
     "uid": "trustmesh-overview", "title": "TrustMesh Overview", "tags": ["trustmesh"], "timezone": "browser",
-    "schemaVersion": 39, "version": 8, "editable": True, "refresh": "5s",
+    "schemaVersion": 39, "version": 9, "editable": True, "refresh": "5s",
     "time": {"from": "now-15m", "to": "now"}, "panels": panels, "annotations": {"list": []},
     "templating": {"list": [{
         "name": "region", "label": "Region", "type": "query", "datasource": PROM,

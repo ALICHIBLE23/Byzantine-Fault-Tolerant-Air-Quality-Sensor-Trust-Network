@@ -131,3 +131,15 @@ def test_foreign_border_sensor_is_context_not_owned(monkeypatch):
     assert mean_row[6] == 5
     assert {r[0] for r in agg.trust_rows} == {f"s-{i}" for i in range(5)}
     assert agg.is_border["s-near"] and agg.is_border["s-4"] and not agg.is_border.get("s-far", False)
+
+
+def test_every_window_produces_a_vote(setup):
+    agg, clock = setup
+    ws = agg.accept_from
+    for i in range(5):
+        agg.handle(Reading(f"s-{i}", "r-0-0", 0.1 * i, 0.1, 50.0, ws + 10, 1).to_json(), clock())
+    clock.ms = ws + 60_000
+    asyncio.run(agg.close_due_windows())
+    vote = agg.vote_queue.get_nowait()
+    assert vote.region == "r-0-0" and vote.window_start == ws
+    assert vote.over and vote.estimate == pytest.approx(50.0, abs=0.5)

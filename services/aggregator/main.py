@@ -25,10 +25,12 @@ Concurrent loops, each with its own error handling and reconnection:
   close    - when a window's grace period has passed, run the trust algorithm and baselines
   write    - publish new epochs, then fenced batch writes to PostgreSQL
   state    - save trust state of led regions to Redis
+  votes    - publish this replica's alert vote for every window (leaders AND standbys vote)
 """
 from __future__ import annotations
 
 import asyncio
+import math
 import signal
 import time
 from collections import defaultdict, deque
@@ -45,7 +47,7 @@ from common.aggregation import ALGORITHMS
 from common.config import Config, load_config
 from common.geo import all_regions, border_cells, distance_to_region, regions_within
 from common.logclient import mqtt_logger, setup_logging
-from common.schemas import DEADLETTER_TOPIC, parse_reading
+from common.schemas import DEADLETTER_TOPIC, Vote, parse_reading, votes_topic
 from common.trust import TrustEngine, TrustParams
 from services.aggregator.leases import LeaseManager, RedisLeaseBackend
 from services.aggregator.reputation import SharedReputation
@@ -89,6 +91,8 @@ BORDER_SENSORS = Gauge("tm_agg_border_sensors", "Foreign border sensors used as 
                        ["region"])
 SHARED_ERRORS = Counter("tm_agg_shared_reputation_errors_total", "Shared reputation reads/updates that failed",
                         ["op"])
+VOTES_SENT = Counter("tm_agg_votes_sent_total", "Alert votes published", ["region"])
+VOTES_DROPPED = Counter("tm_agg_votes_dropped_total", "Alert votes dropped (queue full or publish failed)")
 STATE_SAVES = Counter("tm_agg_trust_state_saves_total", "Trust state snapshots saved to Redis", ["result"])
 
 INSERT_READING = """
@@ -192,6 +196,7 @@ class Aggregator:
         self.dirty_state: set[str] = set()
         self.invalid_logged = 0
         self.flush_now = asyncio.Event()
+        self.vote_queue: asyncio.Queue[Vote] = asyncio.Queue(maxsize=1000)
 
     # ---------------- leadership ----------------
     async def on_promote(self, region: str, epoch: int) -> None:
@@ -439,6 +444,7 @@ class Aggregator:
                                v.flagged, v.reason, ws_dt, self.cfg.instance_id, epoch))
             history_rows.append((ws_dt, v.sensor_id, region, v.reputation, v.flagged, epoch))
 
+        self._queue_vote(region, window_start, result.estimate, leader, epoch)
         if not leader:
             self.backlog[region].append({"estimates": est_rows, "trust": trust_rows, "history": history_rows})
             return
@@ -458,6 +464,40 @@ class Aggregator:
         FLAGGED.labels(region).set(result.n_flagged)
         CONFIDENCE.labels(region).set(result.confidence)
         self.dirty_state.add(region)
+
+    def _queue_vote(self, region: str, window_start: int, estimate: float, leader: bool, epoch: int) -> None:
+        """Every replica votes from its OWN estimate, so votes are independent opinions. VOTE_BIAS makes a
+        replica lie (experiment: a faulty replica must not be able to raise an alert on its own)."""
+        if not math.isfinite(estimate):
+            return
+        value = estimate + self.cfg.vote_bias
+        vote = Vote(region, window_start, self.cfg.instance_id, epoch, leader, value,
+                    value > self.cfg.alert_threshold)
+        try:
+            self.vote_queue.put_nowait(vote)
+        except asyncio.QueueFull:
+            VOTES_DROPPED.inc()
+
+    async def vote_loop(self) -> None:
+        backoff = 1.0
+        while True:
+            try:
+                async with aiomqtt.Client(self.cfg.mqtt_host, self.cfg.mqtt_port,
+                                          identifier=f"agg-{self.cfg.instance_id}-votes",
+                                          logger=mqtt_logger()) as client:
+                    backoff = 1.0
+                    while True:
+                        vote = await self.vote_queue.get()
+                        try:
+                            await client.publish(votes_topic(vote.region), vote.to_json(), qos=1)
+                        except aiomqtt.MqttError:
+                            VOTES_DROPPED.inc()
+                            raise
+                        VOTES_SENT.labels(vote.region).inc()
+            except aiomqtt.MqttError as exc:
+                self.log.warning("vote publisher disconnected (%s); reconnecting in %.0fs", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
     async def _submit_evidence(self, region: str, window_start: int, engine: TrustEngine, result) -> None:
         """Apply this window's evidence for every border sensor to its shared reputation, then adopt the
@@ -648,8 +688,8 @@ async def main() -> None:
         IS_LEADER.labels(region).set(0)
         EPOCH.labels(region).set(0)
     log.info("aggregator %s starting: regions=%s lease_ttl=%dms self_check=%s border_exchange=%s "
-             "concurrency=%s algorithms=%s", cfg.instance_id, regions, cfg.lease_ttl_ms, cfg.fencing_self_check,
-             cfg.border_exchange, cfg.concurrency, ALL_ALGORITHMS)
+             "concurrency=%s vote_bias=%.1f algorithms=%s", cfg.instance_id, regions, cfg.lease_ttl_ms,
+             cfg.fencing_self_check, cfg.border_exchange, cfg.concurrency, cfg.vote_bias, ALL_ALGORITHMS)
 
     # docker stop sends SIGTERM: release leases so a standby takes over at once (no TTL wait).
     loop = asyncio.get_running_loop()
@@ -665,6 +705,7 @@ async def main() -> None:
             tg.create_task(agg.close_loop())
             tg.create_task(agg.write_loop())
             tg.create_task(agg.state_loop())
+            tg.create_task(agg.vote_loop())
     except asyncio.CancelledError:
         log.warning("shutting down: releasing leases %s for immediate failover", sorted(leases.held))
         await leases.release_all()

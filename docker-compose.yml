@@ -39,6 +39,7 @@ x-aggregator-env: &aggregator-env
   BORDER_EXCHANGE: ${BORDER_EXCHANGE:-true}
   CONCURRENCY: ${CONCURRENCY:-optimistic}
   CONCURRENCY_THINK_MS: ${CONCURRENCY_THINK_MS:-0}
+  ALERT_THRESHOLD: ${ALERT_THRESHOLD:-35.5}
 
 services:
   # ---------------- infrastructure ----------------
@@ -177,6 +178,25 @@ services:
       <<: *aggregator-env
       INSTANCE_ID: aggregator-b2
       REGIONS: r-1-0,r-1-1
+      VOTE_BIAS: ${B2_VOTE_BIAS:-0}   # experiment: make this replica lie in its alert votes
+
+  alerting:
+    <<: *python-service
+    command: ["python", "-m", "services.alerting.main"]
+    environment:
+      <<: *python-env
+      INSTANCE_ID: alerting-1
+      ALERT_THRESHOLD: ${ALERT_THRESHOLD:-35.5}
+      ALERT_QUORUM: ${ALERT_QUORUM:-2}
+      ALERT_REPLICAS: 2
+      ALERT_CLEAR_WINDOWS: ${ALERT_CLEAR_WINDOWS:-2}
+    depends_on:
+      mosquitto:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      logging-svc:
+        condition: service_healthy
 
   evaluator:
     <<: *python-service
