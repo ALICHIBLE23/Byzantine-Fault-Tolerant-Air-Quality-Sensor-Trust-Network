@@ -11,6 +11,29 @@ docker compose up -d --build      # build the Python image and start everything
 python -m experiments.check_stage1   # end-to-end check (wait ~30 s after start)
 python -m experiments.check_stage2   # trust check (set BEHAVIOR_MIX, wait 3-4 min)
 python -m experiments.check_stage3   # replication and leadership check
+python -m experiments.check_stage4   # border exchange and shared reputations
+```
+
+## Border exchange and concurrency control
+
+Readings are published to `readings/<region>/<cell>/<sensor>` (1 km cells). Each replica also
+subscribes to the strip of cells along its border, so sensors at a region edge are judged against
+their full neighbourhood. A border sensor is evaluated by every region it borders; its reputation is
+one shared Redis record (`rep:<sensor>`) that every evaluating leader updates after each window, each
+as a partial vote of 1/k (k = number of regions judging it).
+
+Concurrent updates of a shared record are a read-modify-write race. `CONCURRENCY` selects the control:
+
+| Strategy   | How                                                   | Cost                         |
+|------------|-------------------------------------------------------|------------------------------|
+| none       | read, compute, write                                  | loses updates under contention |
+| optimistic | WATCH / MULTI / EXEC, retry if the record changed      | retries under contention     |
+| lock       | distributed lock (SET NX PX + token), then update     | writers wait for each other  |
+| atomic     | the whole update as one Lua script inside Redis       | none, but logic lives in Redis |
+
+```bash
+python -m experiments.concurrency_bench                 # E8: all four strategies vs contention
+python -m experiments.trust_lab --mix "offset_high:0.2" --no-border   # compare without border exchange
 ```
 
 ## Replication and failover
@@ -64,7 +87,7 @@ python -m experiments.trust_lab --sweep --attack offset_high   # plot in results
 | MQTT broker        | localhost:1883                 | watch `readings/#` in MQTT Explorer    |
 | PostgreSQL         | localhost:5432                 | trustmesh / trustmesh / trustmesh      |
 
-## Components (Stage 3)
+## Components (Stage 4)
 
 | Service      | Code                         | Role |
 |--------------|------------------------------|------|

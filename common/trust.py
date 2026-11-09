@@ -77,6 +77,9 @@ class SensorVerdict:
     reputation: float
     flagged: bool
     reason: str
+    score: float = 1.0               # this window's evidence: spatial * temporal
+    prior_reputation: float = 0.5    # reputation before this window's update
+    owned: bool = True               # False: a neighbouring region's border sensor, used as context
 
 
 @dataclass
@@ -87,6 +90,16 @@ class WindowResult:
     n_trusted: int
     n_flagged: int
     verdicts: list[SensorVerdict] = field(default_factory=list)
+
+
+def update_reputation(reputation: float, score: float, params: TrustParams, weight: float = 1.0) -> float:
+    """Asymmetric moving average: trust is lost (alpha_down) much faster than it is earned (alpha_up).
+    A pure function of (old reputation, this window's score): this is what lets the shared border
+    reputation be updated atomically inside Redis (Stage 4). `weight` < 1 makes the update a partial
+    vote: a border sensor judged by k regions gets weight 1/k from each, so per window it moves as
+    much as any other sensor."""
+    alpha = (params.alpha_down if score < reputation else params.alpha_up) * weight
+    return reputation + alpha * (score - reputation)
 
 
 def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
@@ -167,12 +180,20 @@ class TrustEngine:
         return score, reason
 
     # ---------------- main entry ----------------
-    def process_window(self, sensor_ids: list[str], xs, ys, values) -> WindowResult:
+    def process_window(self, sensor_ids: list[str], xs, ys, values, owned=None,
+                       shared: dict[str, float | None] | None = None) -> WindowResult:
+        """`owned` marks this region's own sensors (default: all). Non-owned sensors are border sensors
+        of neighbouring regions: they act as spatial neighbours and are scored, but are excluded from
+        the estimate. `shared` gives current shared reputations of border sensors (Stage 4)."""
         p = self.params
         xs, ys, values = (np.asarray(a, dtype=float) for a in (xs, ys, values))
         n = len(values)
         if n == 0:
             return WindowResult(float("nan"), 0.0, 0, 0, 0)
+        own = np.ones(n, dtype=bool) if owned is None else np.asarray(owned, dtype=bool)
+        for sid, rep in (shared or {}).items():
+            if rep is not None:
+                self.state(sid).reputation = float(rep)
         states = [self.state(sid) for sid in sensor_ids]
         reps = np.array([st.reputation for st in states])
         spatial, refs = self._spatial(xs, ys, values, reps)
@@ -181,8 +202,8 @@ class TrustEngine:
         for i, (sid, st) in enumerate(zip(sensor_ids, states)):
             temporal, t_reason = self._temporal(st, values[i], refs[i])
             score = spatial[i] * temporal
-            alpha = p.alpha_down if score < st.reputation else p.alpha_up
-            st.reputation += alpha * (score - st.reputation)
+            prior = st.reputation
+            st.reputation = update_reputation(st.reputation, score, p)
             st.good_streak = st.good_streak + 1 if score >= p.good_score else 0
             if st.flagged and st.reputation >= p.unflag_threshold and st.good_streak >= p.probation_windows:
                 st.flagged = False
@@ -196,14 +217,18 @@ class TrustEngine:
             st.last_reference = None if np.isnan(refs[i]) else float(refs[i])
             st.windows_seen += 1
             verdicts.append(SensorVerdict(sid, float(values[i]), st.last_reference, float(spatial[i]),
-                                          float(temporal), float(st.reputation), st.flagged, st.reason))
+                                          float(temporal), float(st.reputation), st.flagged, st.reason,
+                                          float(score), float(prior), bool(own[i])))
 
-        trusted = np.array([not st.flagged for st in states])
+        n_own = int(own.sum())
+        if n_own == 0:
+            return WindowResult(float("nan"), 0.0, 0, 0, 0, verdicts)
+        trusted = np.array([not st.flagged for st in states]) & own
         gate = np.minimum(1.0, spatial / p.outlier_gate) if p.outlier_gate > 0 else spatial
         weights = np.array([st.reputation for st in states]) * gate * trusted
         if weights.sum() > 1e-9:
             estimate = float(np.sum(weights * values) / weights.sum())
         else:
-            estimate = float(np.median(values))  # nobody trusted: fall back, confidence 0
-        confidence = float(np.sum(reps * trusted) / n)
-        return WindowResult(estimate, confidence, n, int(trusted.sum()), int(n - trusted.sum()), verdicts)
+            estimate = float(np.median(values[own]))  # nobody trusted: fall back, confidence 0
+        confidence = float(np.sum(reps * trusted) / n_own)
+        return WindowResult(estimate, confidence, n_own, int(trusted.sum()), int(n_own - trusted.sum()), verdicts)

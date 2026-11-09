@@ -93,3 +93,23 @@ def test_trust_is_lost_faster_than_regained(grid):
 def test_empty_window():
     result = TrustEngine().process_window([], [], [], [])
     assert result.n_sensors == 0
+
+
+def test_foreign_sensors_are_neighbours_but_not_in_the_estimate(grid):
+    ids, xs, ys, rng = grid
+    owned = xs < 2.0
+    engine = TrustEngine()
+    values = field(xs, ys, 0)
+    result = engine.process_window(ids, xs, ys, values, owned=owned)
+    assert result.n_sensors == int(owned.sum())
+    assert result.estimate == pytest.approx(float(np.mean(values[owned])), abs=0.5)
+    assert {v.owned for v in result.verdicts} == {True, False}
+
+
+def test_shared_reputation_overrides_local_state(grid):
+    ids, xs, ys, rng = grid
+    engine = TrustEngine()
+    result = engine.process_window(ids, xs, ys, field(xs, ys, 0), shared={ids[0]: 0.05, ids[1]: None})
+    v0 = next(v for v in result.verdicts if v.sensor_id == ids[0])
+    assert v0.prior_reputation == pytest.approx(0.05)
+    assert v0.flagged                       # another region's evidence already made it untrustworthy

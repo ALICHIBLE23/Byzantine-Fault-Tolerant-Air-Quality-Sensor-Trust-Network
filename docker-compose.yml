@@ -36,6 +36,9 @@ x-aggregator-env: &aggregator-env
   LEASE_TTL_MS: ${LEASE_TTL_MS:-3000}
   LEASE_RENEW_MS: ${LEASE_RENEW_MS:-1000}
   FENCING_SELF_CHECK: ${FENCING_SELF_CHECK:-true}
+  BORDER_EXCHANGE: ${BORDER_EXCHANGE:-true}
+  CONCURRENCY: ${CONCURRENCY:-optimistic}
+  CONCURRENCY_THINK_MS: ${CONCURRENCY_THINK_MS:-0}
 
 services:
   # ---------------- infrastructure ----------------

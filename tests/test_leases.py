@@ -154,8 +154,8 @@ def test_failover_hands_over_standby_windows(monkeypatch):
             a.handle(payload, ms["now"])
             b.handle(payload, ms["now"])
     ms["now"] = ws + 3 * 5000
-    a.close_due_windows()
-    b.close_due_windows()
+    run(a.close_due_windows())
+    run(b.close_due_windows())
     assert len(a.estimate_rows) == 2 * 4          # leader buffered 2 windows x 4 algorithms
     assert b.estimate_rows == [] and len(b.backlog["r-0-0"]) == 2
 

@@ -1,4 +1,4 @@
-"""Regional aggregator replica (Stage 3: replicated, leader-based).
+"""Regional aggregator replica (Stage 4: replicated, leader-based, with border exchange).
 
 Each replica serves a partition of regions (REGIONS env, e.g. "r-0-0,r-0-1") and competes for one
 leader lease per region in Redis (services/aggregator/leases.py).
@@ -12,6 +12,12 @@ leader lease per region in Redis (services/aggregator/leases.py).
 On promotion a standby adopts the previous leader's trust state from Redis and writes its backlog,
 so no window is lost during failover. Every database write runs in a transaction that first reads
 the region's newest published epoch (row-locked); a write from an older epoch is rejected.
+
+Border exchange: a replica also receives readings of sensors in neighbouring regions within the trust
+radius of its own regions (subscribing only to the border cells, readings/<region>/<cell>/#). They act
+as spatial neighbours, so sensors at an edge are judged against their full neighbourhood. A border
+sensor is evaluated by every region it borders, and its reputation is one shared record in Redis that
+all evaluating leaders update (services/aggregator/reputation.py, concurrency strategy CONCURRENCY).
 
 Concurrent loops, each with its own error handling and reconnection:
   leases   - acquire / renew / lose leader leases
@@ -37,11 +43,12 @@ from redis.exceptions import RedisError
 
 from common.aggregation import ALGORITHMS
 from common.config import Config, load_config
-from common.geo import all_regions
+from common.geo import all_regions, border_cells, distance_to_region, regions_within
 from common.logclient import mqtt_logger, setup_logging
 from common.schemas import DEADLETTER_TOPIC, parse_reading
-from common.trust import TrustEngine
+from common.trust import TrustEngine, TrustParams
 from services.aggregator.leases import LeaseManager, RedisLeaseBackend
+from services.aggregator.reputation import SharedReputation
 from services.aggregator.trust_store import RedisTrustStore
 
 # ---- pipeline metrics
@@ -76,6 +83,12 @@ LEADER_CHANGES = Counter("tm_agg_leader_changes_total", "Times this replica beca
 FENCED = Counter("tm_agg_fenced_writes_total", "Rows rejected because a newer leader epoch exists", ["kind"])
 NOT_LEADER_DROPS = Counter("tm_agg_not_leader_drops_total", "Buffered rows discarded after losing leadership")
 BACKLOG_HANDOVER = Counter("tm_agg_backlog_windows_total", "Standby windows written after promotion", ["region"])
+BORDER_READINGS = Counter("tm_agg_border_readings_total", "Readings from neighbouring regions' border sensors",
+                          ["region"])
+BORDER_SENSORS = Gauge("tm_agg_border_sensors", "Foreign border sensors used as context in the last window",
+                       ["region"])
+SHARED_ERRORS = Counter("tm_agg_shared_reputation_errors_total", "Shared reputation reads/updates that failed",
+                        ["op"])
 STATE_SAVES = Counter("tm_agg_trust_state_saves_total", "Trust state snapshots saved to Redis", ["result"])
 
 INSERT_READING = """
@@ -126,6 +139,8 @@ FUTURE_TOLERANCE_MS = 60_000
 BACKLOG_WINDOWS = 3
 READING_BACKLOG = 1500
 ALL_ALGORITHMS = [*ALGORITHMS, "trustmesh"]
+TRUST_RADIUS_KM = TrustParams().radius_km
+MAX_PARALLEL_UPDATES = 32
 
 
 def now_ms() -> int:
@@ -142,11 +157,13 @@ def with_epoch(row: tuple, epoch: int) -> tuple:
 
 
 class Aggregator:
-    def __init__(self, cfg: Config, log, leases, store: RedisTrustStore | None = None):
+    def __init__(self, cfg: Config, log, leases, store: RedisTrustStore | None = None,
+                 reputations: SharedReputation | None = None):
         self.cfg = cfg
         self.log = log
         self.leases = leases
         self.store = store
+        self.reputations = reputations if cfg.border_exchange else None
         self.window_ms = cfg.window_ms
         self.regions = sorted(cfg.region_filter or all_regions(cfg))
         self.region_set = set(self.regions)
@@ -158,6 +175,10 @@ class Aggregator:
         self.closed_up_to = self.accept_from
         self.seen: dict[str, tuple[deque, set]] = {}
         self.positions: dict[str, tuple[float, float]] = {}
+        self.sensor_region: dict[str, str] = {}
+        self.targets: dict[str, list[str]] = {}     # sensor -> my regions whose windows it belongs to
+        self.is_border: dict[str, bool] = {}        # sensor -> evaluated by more than one region?
+        self.evaluators: dict[str, int] = {}        # sensor -> number of regions that evaluate it
         self.engines: dict[str, TrustEngine] = defaultdict(TrustEngine)  # one per region
         # Write buffers (leader). Every estimate / trust / history row ends with its epoch.
         self.reading_rows: list[tuple] = []
@@ -271,16 +292,23 @@ class Aggregator:
             return self._reject(str(exc))
         if r.ts > recv_ms + FUTURE_TOLERANCE_MS:
             return self._reject(f"timestamp {r.ts} is in the future")
-        if r.region not in self.region_set:
+        targets = self._targets_for(r.sensor_id, r.region, r.x, r.y)
+        if not targets:
             return "ignored"
         if self._is_duplicate(r.sensor_id, r.seq):
             DUPLICATES.inc()
             return "duplicate"
 
-        READINGS.labels(r.region).inc()
-        INGEST_DELAY.observe(max(0.0, (recv_ms - r.ts) / 1000))
+        own = r.region in self.region_set
+        if not own:
+            BORDER_READINGS.labels(r.region).inc()
+        else:
+            READINGS.labels(r.region).inc()
+            INGEST_DELAY.observe(max(0.0, (recv_ms - r.ts) / 1000))
         row = (r.sensor_id, r.seq, r.region, to_dt(r.ts), r.value, to_dt(recv_ms))
-        if self.leases.is_leader(r.region):
+        if not own:
+            pass  # the owner's leader stores foreign readings
+        elif self.leases.is_leader(r.region):
             self.reading_rows.append(row)
             if len(self.reading_rows) > MAX_BUFFERED_READINGS:
                 overflow = len(self.reading_rows) - MAX_BUFFERED_READINGS
@@ -294,14 +322,43 @@ class Aggregator:
             if window_start >= self.accept_from:
                 LATE.inc()
             return "late"
-        key = (r.region, window_start)
         self.positions[r.sensor_id] = (r.x, r.y)
-        self.windows[key][r.sensor_id].append(r.value)
-        self.window_counts[key] += 1
-        return "ok"
+        for region in targets:
+            key = (region, window_start)
+            self.windows[key][r.sensor_id].append(r.value)
+            if region == r.region:
+                self.window_counts[key] += 1
+        return "ok" if own else "border"
+
+    def topics(self) -> list[str]:
+        topics = [f"readings/{r}/#" for r in self.regions]
+        if self.cfg.border_exchange:
+            foreign = {(fr, cell) for r in self.regions for fr, cell in border_cells(r, self.cfg, TRUST_RADIUS_KM)
+                       if fr not in self.region_set}
+            topics += [f"readings/{fr}/{cell}/#" for fr, cell in sorted(foreign)]
+        return topics
+
+    def _targets_for(self, sensor_id: str, region: str, x: float, y: float) -> list[str]:
+        """My regions whose windows this sensor belongs to (its own region if mine, plus my regions
+        within the trust radius when border exchange is on). Cached: sensors do not move."""
+        targets = self.targets.get(sensor_id)
+        if targets is None:
+            targets = [region] if region in self.region_set else []
+            if self.cfg.border_exchange:
+                targets += [r for r in self.regions
+                            if r != region and distance_to_region(x, y, r, self.cfg) <= TRUST_RADIUS_KM]
+                neighbours = regions_within(x, y, self.cfg, TRUST_RADIUS_KM)
+                self.is_border[sensor_id] = bool(neighbours)
+                self.evaluators[sensor_id] = 1 + len(neighbours)
+            else:
+                self.is_border[sensor_id] = False
+                self.evaluators[sensor_id] = 1
+            self.targets[sensor_id] = targets
+            self.sensor_region[sensor_id] = region
+        return targets
 
     async def consume(self) -> None:
-        topics = [f"readings/{r}/#" for r in self.regions]
+        topics = self.topics()
         backoff = 1.0
         while True:
             try:
@@ -323,44 +380,61 @@ class Aggregator:
                 backoff = min(backoff * 2, 30.0)
 
     # ---------------- windowing ----------------
-    def close_due_windows(self) -> None:
+    async def close_due_windows(self) -> None:
         now = now_ms()
         horizon = now - self.cfg.grace_ms
         self.closed_up_to = max(self.closed_up_to, horizon - horizon % self.window_ms)
         due = sorted((k for k in self.windows if k[1] < self.closed_up_to), key=lambda k: k[1])
         for key in due:
-            self._close_window(key)
+            await self._close_window(key)
         if due:
             self.flush_now.set()
 
-    def _close_window(self, key: tuple[str, int]) -> None:
-        per_sensor = self.windows.pop(key)
+    async def _close_window(self, key: tuple[str, int]) -> None:
+        per_sensor = self.windows.pop(key)   # popped first: readings arriving during the awaits go elsewhere
         n_readings = self.window_counts.pop(key, 0)
         region, window_start = key
         sensor_ids = list(per_sensor)
+        owned = np.array([self.sensor_region.get(s) == region for s in sensor_ids])
+        if not owned.any():
+            return  # only neighbours' border sensors reported in this window
         # Average each sensor first so every sensor counts once, however often it reported.
         values = np.fromiter((sum(v) / len(v) for v in per_sensor.values()), dtype=float, count=len(per_sensor))
         xs = np.array([self.positions[s][0] for s in sensor_ids])
         ys = np.array([self.positions[s][1] for s in sensor_ids])
         ws_dt = to_dt(window_start)
+        BORDER_SENSORS.labels(region).set(int((~owned).sum()))
+
+        border_ids = [s for s in sensor_ids if self.is_border.get(s)]
+        shared: dict[str, float | None] = {}
+        if self.reputations is not None and border_ids:
+            try:
+                shared = await self.reputations.read_many(border_ids)
+            except RedisError as exc:
+                SHARED_ERRORS.labels("read").inc()
+                self.log.warning("shared reputations unavailable for %s (%s); using local state", region, exc)
 
         engine = self.engines[region]
         was_flagged = {s for s in sensor_ids if s in engine.states and engine.states[s].flagged}
         started = time.perf_counter()
-        result = engine.process_window(sensor_ids, xs, ys, values)
+        result = engine.process_window(sensor_ids, xs, ys, values, owned=owned, shared=shared)
         TRUST_SECONDS.observe(time.perf_counter() - started)
         WINDOWS_CLOSED.labels(region).inc()
 
         leader = self.leases.is_leader(region)
         epoch = self.leases.epoch(region) if leader else 0
-        estimates = {name: fn(values) for name, fn in ALGORITHMS.items()}
+        if leader and self.reputations is not None and border_ids:
+            await self._submit_evidence(region, window_start, engine, result)
+        own_values = values[owned]
+        estimates = {name: fn(own_values) for name, fn in ALGORITHMS.items()}
         estimates["trustmesh"] = result.estimate
         window_end = window_start + self.window_ms
-        est_rows = [((region, ws_dt, self.window_ms, name, value, n_readings, len(values),
+        est_rows = [((region, ws_dt, self.window_ms, name, value, n_readings, len(own_values),
                       self.cfg.instance_id, epoch), window_end if i == 0 else None)
                     for i, (name, value) in enumerate(estimates.items())]
         trust_rows, history_rows = [], []
-        for v in result.verdicts:
+        own_verdicts = [v for v in result.verdicts if v.owned]
+        for v in own_verdicts:
             trust_rows.append((v.sensor_id, region, v.reputation, v.spatial, v.temporal, v.value, v.reference,
                                v.flagged, v.reason, ws_dt, self.cfg.instance_id, epoch))
             history_rows.append((ws_dt, v.sensor_id, region, v.reputation, v.flagged, epoch))
@@ -380,13 +454,33 @@ class Aggregator:
                 DB_DROPPED.inc(overflow)
         for name, value in estimates.items():
             ESTIMATE.labels(region, name).set(value)
-        WINDOW_SENSORS.labels(region).set(len(values))
+        WINDOW_SENSORS.labels(region).set(len(own_values))
         FLAGGED.labels(region).set(result.n_flagged)
         CONFIDENCE.labels(region).set(result.confidence)
         self.dirty_state.add(region)
 
+    async def _submit_evidence(self, region: str, window_start: int, engine: TrustEngine, result) -> None:
+        """Apply this window's evidence for every border sensor to its shared reputation, then adopt the
+        merged value (which also contains the other regions' evidence)."""
+        limit = asyncio.Semaphore(MAX_PARALLEL_UPDATES)
+
+        async def one(v) -> None:
+            async with limit:
+                try:
+                    merged, _, _, _ = await self.reputations.apply(
+                        v.sensor_id, v.score, region, window_start, prior=v.prior_reputation,
+                        weight=1.0 / self.evaluators.get(v.sensor_id, 1))
+                    engine.state(v.sensor_id).reputation = merged
+                except Exception as exc:
+                    SHARED_ERRORS.labels("update").inc()
+                    self.log.warning("shared reputation update for %s failed (%s)", v.sensor_id, exc)
+
+        await asyncio.gather(*(one(v) for v in result.verdicts if self.is_border.get(v.sensor_id)))
+
     def _log_flag_changes(self, region: str, result, was_flagged: set[str]) -> None:
         for v in result.verdicts:
+            if not v.owned:
+                continue
             if v.flagged and v.sensor_id not in was_flagged:
                 FLAG_EVENTS.labels(region, v.reason or "low reputation").inc()
                 ref = f"{v.reference:.1f}" if v.reference is not None else "n/a"
@@ -400,7 +494,7 @@ class Aggregator:
         while True:
             await asyncio.sleep(0.25)
             try:
-                self.close_due_windows()
+                await self.close_due_windows()
             except Exception:
                 self.log.exception("window close failed; continuing")
 
@@ -546,14 +640,16 @@ async def main() -> None:
     regions = sorted(cfg.region_filter or all_regions(cfg))
     leases = LeaseManager(RedisLeaseBackend(redis), regions, cfg.instance_id, ttl_ms=cfg.lease_ttl_ms,
                           renew_interval_s=cfg.lease_renew_ms / 1000, self_check=cfg.fencing_self_check, log=log)
-    agg = Aggregator(cfg, log, leases, RedisTrustStore(redis))
+    reputations = SharedReputation(redis, cfg.concurrency, think_ms=cfg.concurrency_think_ms)
+    agg = Aggregator(cfg, log, leases, RedisTrustStore(redis), reputations)
     leases.on_promote = agg.on_promote
     leases.on_demote = agg.on_demote
     for region in regions:
         IS_LEADER.labels(region).set(0)
         EPOCH.labels(region).set(0)
-    log.info("aggregator %s starting: regions=%s lease_ttl=%dms self_check=%s algorithms=%s",
-             cfg.instance_id, regions, cfg.lease_ttl_ms, cfg.fencing_self_check, ALL_ALGORITHMS)
+    log.info("aggregator %s starting: regions=%s lease_ttl=%dms self_check=%s border_exchange=%s "
+             "concurrency=%s algorithms=%s", cfg.instance_id, regions, cfg.lease_ttl_ms, cfg.fencing_self_check,
+             cfg.border_exchange, cfg.concurrency, ALL_ALGORITHMS)
 
     # docker stop sends SIGTERM: release leases so a standby takes over at once (no TTL wait).
     loop = asyncio.get_running_loop()

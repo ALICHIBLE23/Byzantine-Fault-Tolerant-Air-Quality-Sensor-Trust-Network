@@ -8,8 +8,10 @@ from dataclasses import dataclass
 SCHEMA_VERSION = 1
 
 
-def readings_topic(region: str, sensor_id: str) -> str:
-    return f"readings/{region}/{sensor_id}"
+def readings_topic(region: str, cell: str, sensor_id: str) -> str:
+    """readings/<region>/<cell>/<sensor>: owners subscribe to readings/<region>/#, neighbours to
+    readings/<region>/<cell>/# for the cells along their border."""
+    return f"readings/{region}/{cell}/{sensor_id}"
 
 
 DEADLETTER_TOPIC = "deadletter/readings"

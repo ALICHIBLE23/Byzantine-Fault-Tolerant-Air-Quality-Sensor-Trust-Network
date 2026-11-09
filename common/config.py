@@ -70,6 +70,10 @@ class Config:
     behavior_mix: str
     # Aggregation
     regions: str
+    cell_km: float
+    border_exchange: bool
+    concurrency: str
+    concurrency_think_ms: float
     window_ms: int
     grace_ms: int
     db_flush_interval_s: float
@@ -122,6 +126,10 @@ def load_config(service_name: str) -> Config:
         noise_std=_get("NOISE_STD", 2.0, float),
         behavior_mix=_get("BEHAVIOR_MIX", ""),
         regions=_get("REGIONS", "all"),
+        cell_km=_get("CELL_KM", 1.0, float),
+        border_exchange=_get("BORDER_EXCHANGE", True, _bool),
+        concurrency=_get("CONCURRENCY", "optimistic"),
+        concurrency_think_ms=_get("CONCURRENCY_THINK_MS", 0.0, float),
         window_ms=_get("WINDOW_MS", 5000, int),
         grace_ms=_get("GRACE_MS", 2000, int),
         db_flush_interval_s=_get("DB_FLUSH_INTERVAL_S", 1.0, float),

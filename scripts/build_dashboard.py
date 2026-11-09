@@ -163,9 +163,11 @@ panels += [
                   "expr": 'max by (region, job_instance) (label_replace(tm_agg_is_leader, "job_instance", "$1", "instance", "(.*):.*"))',
                   "legendFormat": "{{region}} {{job_instance}}"}],
      "fieldConfig": {"defaults": {
-         "color": {"mode": "thresholds"},
-         "thresholds": {"mode": "absolute", "steps": [{"color": "#3a3a3a", "value": None}, {"color": "green", "value": 1}]},
-         "mappings": [{"type": "range", "options": {"from": -0.5, "to": 0.5, "result": {"text": "standby", "index": 0}}},
+         # No threshold colouring: with it, the state timeline shows threshold buckets ("< 1", "1+")
+         # instead of the mapped names. The mappings below set both text and colour.
+         "color": {"mode": "fixed", "fixedColor": "#3a3a3a"},
+         "mappings": [{"type": "range", "options": {"from": -0.5, "to": 0.5,
+                                                    "result": {"text": "standby", "color": "#3a3a3a", "index": 0}}},
                       {"type": "range", "options": {"from": 0.5, "to": 1.5,
                                                     "result": {"text": "LEADER", "color": "green", "index": 1}}}],
          "custom": {"fillOpacity": 80, "lineWidth": 0}}, "overrides": []},
@@ -176,9 +178,29 @@ panels += [
                desc="Increments every time a region gets a new leader. Writes from older epochs are rejected."),
 ]
 
+# ---- border exchange and concurrency control (Stage 4), at the bottom
+BOTTOM = max(p["gridPos"]["y"] + p["gridPos"]["h"] for p in panels)
+panels += [
+    timeseries("Border readings received per replica",
+               [('sum by (job_instance) (label_replace(rate(tm_agg_border_readings_total[1m]), "job_instance", "$1", '
+                 '"instance", "(.*):.*"))', "{{job_instance}}")],
+               0, BOTTOM, w=8, unit="reqps",
+               desc="Readings from neighbouring regions' border cells, used as spatial context."),
+    timeseries("Shared reputation updates", [
+        ("sum by (result) (rate(tm_rep_updates_total[1m]))", "{{result}}/s"),
+        ("sum(rate(tm_rep_conflicts_total[1m]))", "optimistic conflicts/s"),
+    ], 8, BOTTOM, w=8, unit="reqps",
+        desc="Evidence applied to shared border reputations. Each optimistic conflict is a concurrent write "
+             "that would have been a lost update without concurrency control."),
+    timeseries("Shared update latency", [
+        ("histogram_quantile(0.95, sum by (le, strategy) (rate(tm_rep_update_seconds_bucket[1m])))", "p95 {{strategy}}"),
+        ("histogram_quantile(0.95, sum by (le) (rate(tm_rep_lock_wait_seconds_bucket[1m])))", "lock wait p95"),
+    ], 16, BOTTOM, w=8, unit="s"),
+]
+
 dashboard = {
     "uid": "trustmesh-overview", "title": "TrustMesh Overview", "tags": ["trustmesh"], "timezone": "browser",
-    "schemaVersion": 39, "version": 6, "editable": True, "refresh": "5s",
+    "schemaVersion": 39, "version": 8, "editable": True, "refresh": "5s",
     "time": {"from": "now-15m", "to": "now"}, "panels": panels, "annotations": {"list": []},
     "templating": {"list": [{
         "name": "region", "label": "Region", "type": "query", "datasource": PROM,

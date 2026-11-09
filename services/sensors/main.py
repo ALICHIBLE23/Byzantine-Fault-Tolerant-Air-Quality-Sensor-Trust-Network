@@ -17,6 +17,7 @@ from prometheus_client import Counter, Gauge, start_http_server
 from common.config import Config, load_config
 from common.logclient import mqtt_logger, setup_logging
 from common.schemas import Reading, readings_topic
+from common.geo import cell_of
 from common.truth import truth
 from services.sensors.behaviors import Behavior, make_behavior
 from services.sensors.fleet import SensorSpec, build_fleet
@@ -44,7 +45,7 @@ class SimSensor:
         # Starting the sequence at the boot time in ms keeps it increasing across restarts,
         # so (sensor_id, seq) stays unique and deduplication keeps working.
         self.seq = seq_start
-        self.topic = readings_topic(spec.region, spec.sensor_id)
+        self.topic = readings_topic(spec.region, cell_of(spec.x_km, spec.y_km, cfg), spec.sensor_id)
 
 
 async def register_fleet(cfg: Config, fleet: list[SensorSpec], log) -> None:
